@@ -464,15 +464,21 @@ func serveOnce(
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
-		token := strings.TrimPrefix(r.URL.Path, tokenPathPrefix)
-		token = strings.Trim(token, "/")
-		if strings.Contains(token, ".") {
+		raw := strings.TrimPrefix(r.URL.Path, tokenPathPrefix)
+		raw = strings.Trim(raw, "/")
+		if raw == "" {
+			http.Error(w, "Missing token", http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(raw, ".") {
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
-		if token == "" {
-			http.Error(w, "Missing token", http.StatusBadRequest)
-			return
+		parts := strings.Split(raw, "/")
+		token := strings.TrimSpace(parts[0])
+		action := ""
+		if len(parts) >= 2 {
+			action = strings.TrimSpace(parts[1])
 		}
 
 		e, ok := s.get(token)
@@ -482,6 +488,27 @@ func serveOnce(
 		}
 
 		target := strings.TrimSpace(e.URL)
+		// Extended endpoints: /<token>/seg|key|pl?u=<upstream>
+		// These are used by CatPawOpen m3u8 rewriting, where playlists stay in CatPawOpen
+		// and binary payloads (segments/keys) are proxied by Go for performance.
+		if action == "seg" || action == "key" || action == "pl" {
+			writeCORSHeaders(w)
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			uParam := strings.TrimSpace(r.URL.Query().Get("u"))
+			if uParam == "" {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			decoded, err := url.QueryUnescape(uParam)
+			if err != nil || strings.TrimSpace(decoded) == "" {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			target = strings.TrimSpace(decoded)
+		}
 		if target == "" {
 			http.Error(w, "Invalid url", http.StatusBadRequest)
 			return
