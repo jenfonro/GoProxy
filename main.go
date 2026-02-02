@@ -43,9 +43,9 @@ const (
 )
 
 type entry struct {
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers"`
-	TS      time.Time         `json:"-"`
+	URL         string       `json:"url"`
+	HeaderLines []headerLine `json:"headers"`
+	TS          time.Time    `json:"-"`
 }
 
 type store struct {
@@ -102,19 +102,66 @@ func randomToken(nBytes int) string {
 	return hex.EncodeToString(b)
 }
 
-func filterProxyHeaders(in map[string]string, allowedLower map[string]bool) map[string]string {
-	out := map[string]string{}
+type headerLine struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+func mapToHeaderLines(in map[string]string) []headerLine {
+	if in == nil {
+		return nil
+	}
+	out := make([]headerLine, 0, len(in))
 	for k, v := range in {
-		key := http.CanonicalHeaderKey(strings.TrimSpace(k))
+		key := strings.TrimSpace(k)
 		val := strings.TrimSpace(v)
 		if key == "" || val == "" {
 			continue
 		}
-		if allowedLower[strings.ToLower(key)] {
-			out[key] = val
-		}
+		out = append(out, headerLine{Key: key, Value: val})
 	}
 	return out
+}
+
+func sanitizeHeaderLines(lines []headerLine) []headerLine {
+	if len(lines) == 0 {
+		return nil
+	}
+	out := make([]headerLine, 0, len(lines))
+	for _, kv := range lines {
+		key := strings.TrimSpace(kv.Key)
+		val := strings.TrimSpace(kv.Value)
+		if key == "" || val == "" {
+			continue
+		}
+		out = append(out, headerLine{Key: key, Value: val})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func applyHeaderLines(req *http.Request, lines []headerLine) (hostOverride string) {
+	if req == nil || len(lines) == 0 {
+		return ""
+	}
+	for _, kv := range lines {
+		k := strings.TrimSpace(kv.Key)
+		v := strings.TrimSpace(kv.Value)
+		if k == "" || v == "" {
+			continue
+		}
+		// Host is special in net/http: it must be set via req.Host.
+		if strings.EqualFold(k, "Host") {
+			if hostOverride == "" {
+				hostOverride = v
+			}
+			continue
+		}
+		req.Header.Add(k, v)
+	}
+	return hostOverride
 }
 
 type repeatReader struct {
@@ -454,12 +501,8 @@ func serveOnce(
 			return
 		}
 
-		// Only send a safe subset of headers to upstream.
-		allowedOut := map[string]bool{"cookie": true, "user-agent": true, "referer": true, "authorization": true}
-		outHeaders := filterProxyHeaders(e.Headers, allowedOut)
-
 		tw := &trackedWriter{ResponseWriter: w}
-		if err := proxyStream(client, tw, r, target, outHeaders, r.Method == http.MethodHead); err != nil {
+		if err := proxyStream(client, tw, r, target, e.HeaderLines, r.Method == http.MethodHead); err != nil {
 			log.Printf("[proxy] token=%s error=%v", token, err)
 			if !tw.WroteHeader {
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -482,8 +525,9 @@ func serveOnce(
 		writeCORSHeaders(w)
 
 		var in struct {
-			URL     string            `json:"url"`
-			Headers map[string]string `json:"headers"`
+			URL         string          `json:"url"`
+			Headers     json.RawMessage `json:"headers"`
+			HeadersList []headerLine    `json:"headersList"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -509,10 +553,23 @@ func serveOnce(
 			return
 		}
 
-		allowedOut := map[string]bool{"cookie": true, "user-agent": true, "referer": true, "authorization": true}
-		h := filterProxyHeaders(in.Headers, allowedOut)
+		var hdrLines []headerLine
+		if len(in.HeadersList) > 0 {
+			hdrLines = sanitizeHeaderLines(in.HeadersList)
+		} else if len(in.Headers) > 0 {
+			// Backward-compatible: accept {"headers": {"k":"v"}} or {"headers":[{"key":"k","value":"v"}...]}
+			var m map[string]string
+			if err := json.Unmarshal(in.Headers, &m); err == nil {
+				hdrLines = sanitizeHeaderLines(mapToHeaderLines(m))
+			} else {
+				var list []headerLine
+				if err2 := json.Unmarshal(in.Headers, &list); err2 == nil {
+					hdrLines = sanitizeHeaderLines(list)
+				}
+			}
+		}
 
-		token := s.put(&entry{URL: in.URL, Headers: h})
+		token := s.put(&entry{URL: in.URL, HeaderLines: hdrLines})
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"token": token})
@@ -640,7 +697,7 @@ func (tw *trackedWriter) WriteHeader(code int) {
 	tw.ResponseWriter.WriteHeader(code)
 }
 
-func proxyStream(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers map[string]string, headOnly bool) error {
+func proxyStream(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers []headerLine, headOnly bool) error {
 	rangeHeader := r.Header.Get("Range")
 	ifRange := r.Header.Get("If-Range")
 
@@ -679,7 +736,7 @@ func proxyStream(client *http.Client, w http.ResponseWriter, r *http.Request, ta
 	return streamCopy(w, upRes.Body)
 }
 
-func followRedirects(ctx context.Context, client *http.Client, target string, headers map[string]string, rangeHeader string, ifRange string) (*http.Response, error) {
+func followRedirects(ctx context.Context, client *http.Client, target string, headers []headerLine, rangeHeader string, ifRange string) (*http.Response, error) {
 	cur := target
 	for i := 0; i < 10; i++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, cur, nil)
@@ -687,21 +744,20 @@ func followRedirects(ctx context.Context, client *http.Client, target string, he
 			return nil, err
 		}
 
-		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Encoding", "identity")
+		hostOverride := applyHeaderLines(req, headers)
+		if hostOverride != "" {
+			req.Host = hostOverride
+		}
 
+		// Range/If-Range are controlled by proxy logic (chunking, etc).
+		// When present, drop any registered Range/If-Range and apply the selected values.
 		if rangeHeader != "" {
-			req.Header.Set("Range", rangeHeader)
+			req.Header.Del("Range")
+			req.Header.Add("Range", rangeHeader)
 		}
 		if ifRange != "" {
-			req.Header.Set("If-Range", ifRange)
-		}
-
-		for k, v := range headers {
-			if v == "" {
-				continue
-			}
-			req.Header.Set(k, v)
+			req.Header.Del("If-Range")
+			req.Header.Add("If-Range", ifRange)
 		}
 
 		res, err := client.Do(req)
@@ -848,7 +904,7 @@ func parseContentRangeTotal(h string) (total int64, ok bool) {
 	return t, true
 }
 
-func proxyStreamChunked(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers map[string]string, ifRange string, start int64, end int64, chunkSize int64) error {
+func proxyStreamChunked(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers []headerLine, ifRange string, start int64, end int64, chunkSize int64) error {
 	ctx := r.Context()
 	curStart := start
 
