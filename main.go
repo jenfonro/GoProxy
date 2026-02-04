@@ -23,19 +23,19 @@ import (
 
 // BuildVersion can be set at build time with:
 //
-//	go build -ldflags "-X catpawopen-go-proxy.BuildVersion=v1.0.0"
+//	go build -ldflags "-X main.BuildVersion=v1.0.0"
 //
 // When present and valid, it is returned from GET /version (as "v<semver>").
 var BuildVersion string
 
 // BuildCommit can be set at build time with:
 //
-//	go build -ldflags "-X catpawopen-go-proxy.BuildCommit=abcdef0"
+//	go build -ldflags "-X main.BuildCommit=abcdef0"
 //
 // It is used for CI beta builds: GET /version => beta-<commit>.
 var BuildCommit string
 
-var localBetaStamp = strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
+var localBetaStamp = strconv.FormatInt(time.Now().UnixMilli(), 10)
 
 const (
 	defaultListenHost = "0.0.0.0"

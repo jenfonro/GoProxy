@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. v1.0.0)"
+        description: "Release version (e.g. v1.0.0 or V1.0.0)"
         required: true
 
 permissions:
@@ -49,8 +49,8 @@ jobs:
             echo "version is required" >&2
             exit 1
           fi
-          if [[ "${v}" != v* ]]; then
-            echo "version must start with 'v' (e.g. v1.0.0)" >&2
+          if [[ "${v}" != v* && "${v}" != V* ]]; then
+            echo "version must start with 'v' or 'V' (e.g. v1.0.0)" >&2
             exit 1
           fi
           if [[ "${v}" =~ [[:space:]] ]]; then
@@ -82,7 +82,7 @@ jobs:
           ext=""
           if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
           out="dist/goproxy_${GOOS}_${GOARCH}${ext}"
-          go build -trimpath -ldflags="-s -w -X catpawopen-go-proxy.BuildVersion=${{ inputs.version }}" -o "${out}" .
+          go build -trimpath -ldflags="-s -w -X main.BuildVersion=${{ inputs.version }}" -o "${out}" .
           echo "built: ${out}"
 
       - uses: actions/upload-artifact@v4

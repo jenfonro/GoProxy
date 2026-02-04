@@ -75,7 +75,7 @@ jobs:
           ext=""
           if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
           out="dist/goproxy_${GOOS}_${GOARCH}${ext}"
-          go build -trimpath -ldflags="-s -w -X catpawopen-go-proxy.BuildCommit=${{ env.GOPROXY_COMMIT }}" -o "${out}" .
+          go build -trimpath -ldflags="-s -w -X main.BuildCommit=${{ env.GOPROXY_COMMIT }}" -o "${out}" .
           echo "built: ${out}"
 
       - uses: actions/upload-artifact@v4
