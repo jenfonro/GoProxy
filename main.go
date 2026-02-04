@@ -602,6 +602,22 @@ func serveOnce(
 		_ = json.NewEncoder(w).Encode(map[string]string{"token": token})
 	})
 
+	// Version endpoint: GET /version (or /<basePath>/version)
+	mux.HandleFunc(mountPath(basePath, "/version"), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			writeCORSHeaders(w)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeCORSHeaders(w)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]string{"version": serverVersion()})
+	})
+
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           mux,

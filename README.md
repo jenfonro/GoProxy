@@ -10,6 +10,8 @@
   - `GET /<token>`
 - 测速
   - `GET /speed?bytes=2097152`（返回指定大小的随机字节，用于前端测速）
+- 版本信息
+  - `GET /version`（返回：`{ "version": "<version>" }`；未注入版本时为 `beta`）
 
 ## 运行
 
@@ -34,3 +36,4 @@ go run .
 - 注册：`POST /proxy/register`
 - 透传：`GET /proxy/<token>`
 - 测速：`GET /proxy/speed?bytes=2097152`
+- 版本：`GET /proxy/version`
