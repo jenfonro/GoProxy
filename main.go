@@ -24,7 +24,18 @@ import (
 // BuildVersion can be set at build time with:
 //
 //	go build -ldflags "-X catpawopen-go-proxy.BuildVersion=v1.0.0"
+//
+// When present and valid, it is returned from GET /version (as "v<semver>").
 var BuildVersion string
+
+// BuildCommit can be set at build time with:
+//
+//	go build -ldflags "-X catpawopen-go-proxy.BuildCommit=abcdef0"
+//
+// It is used for CI beta builds: GET /version => beta-<commit>.
+var BuildCommit string
+
+var localBetaStamp = strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
 
 const (
 	defaultListenHost = "0.0.0.0"
@@ -218,9 +229,13 @@ func (cw *ctxWriter) Write(p []byte) (int, error) {
 func serverVersion() string {
 	semver := normalizeReleaseSemver(strings.TrimSpace(BuildVersion))
 	if semver == "" {
-		return "beta"
+		commit := strings.TrimSpace(BuildCommit)
+		if commit != "" {
+			return "beta-" + commit
+		}
+		return "beta-" + localBetaStamp
 	}
-	return semver
+	return "V" + semver
 }
 
 func normalizeReleaseSemver(raw string) string {

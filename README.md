@@ -11,7 +11,7 @@
 - 测速
   - `GET /speed?bytes=2097152`（返回指定大小的随机字节，用于前端测速）
 - 版本信息
-  - `GET /version`（返回：`{ "version": "<version>" }`；未注入版本时为 `beta`）
+  - `GET /version`（返回：`{ "version": "<version>" }`；本地为 `beta-<timestamp>`，云端 beta 为 `beta-<commit>`，release 为 `V1.0.0`）
 
 ## 运行
 
