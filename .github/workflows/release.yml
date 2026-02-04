@@ -81,13 +81,13 @@ jobs:
           mkdir -p dist
           ext=""
           if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
-          out="dist/goproxy_${{ inputs.version }}_${GOOS}_${GOARCH}${ext}"
-          go build -trimpath -ldflags="-s -w" -o "${out}" .
+          out="dist/goproxy_${GOOS}_${GOARCH}${ext}"
+          go build -trimpath -ldflags="-s -w -X catpawopen-go-proxy.BuildVersion=${{ inputs.version }}" -o "${out}" .
           echo "built: ${out}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: goproxy_${{ inputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          name: goproxy_${{ matrix.goos }}_${{ matrix.goarch }}
           path: dist/
           if-no-files-found: error
 
