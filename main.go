@@ -403,6 +403,21 @@ func serveOnce(
 
 	mux := http.NewServeMux()
 
+	// Reject unregistered routes with 403 (instead of falling back to net/http 404).
+	// When basePath is set (e.g. "/proxy"), also reject the basePath root ("/proxy") directly
+	// to avoid net/http's implicit redirect to "/proxy/".
+	if basePath != "" {
+		mux.HandleFunc(basePath, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodOptions {
+				writeCORSHeaders(w)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			writeCORSHeaders(w)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		})
+	}
+
 	// Client speed test endpoint: serves synthetic bytes to measure download throughput.
 	// Example: GET /speed?bytes=2097152
 	speedPath := mountPath(basePath, "/speed")
@@ -459,9 +474,11 @@ func serveOnce(
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		writeCORSHeaders(w)
+
 		// Do not treat `/` (or the basePath root) as a token request.
 		if r.URL.Path == tokenPathPrefix {
-			http.Error(w, "Not Found", http.StatusNotFound)
+			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		raw := strings.TrimPrefix(r.URL.Path, tokenPathPrefix)
@@ -470,12 +487,22 @@ func serveOnce(
 			http.Error(w, "Missing token", http.StatusBadRequest)
 			return
 		}
-		if strings.Contains(raw, ".") {
-			http.Error(w, "Not Found", http.StatusNotFound)
+
+		parts := strings.Split(raw, "/")
+		seg0 := strings.TrimSpace(parts[0])
+
+		// Do not allow paths that look like unregistered routes.
+		// Example: /register/ or /speed/ should be rejected, not treated as a token.
+		if seg0 == "register" || seg0 == "speed" || seg0 == "version" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
-		parts := strings.Split(raw, "/")
-		token := strings.TrimSpace(parts[0])
+		if strings.Contains(raw, ".") || len(parts) > 2 {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		token := seg0
 		action := ""
 		if len(parts) >= 2 {
 			action = strings.TrimSpace(parts[1])
