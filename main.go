@@ -475,6 +475,143 @@ func serveOnce(
 		_, _ = io.CopyN(&ctxWriter{ctx: r.Context(), w: w}, reader, n)
 	})
 
+	// TMDB API proxy: GET/HEAD /tmdb/<path> -> https://api.themoviedb.org/<path>
+	//
+	// This is intended to be used as MeowFilm's `tmdb_api_base`, e.g.:
+	// - GoProxy basePath="/proxy"
+	// - MeowFilm tmdb_api_base="https://example.com/proxy/tmdb/3"
+	//
+	// Notes:
+	// - Keep the upstream host fixed to avoid SSRF.
+	// - Register a longer prefix than tokenPathPrefix so net/http mux picks it.
+	tmdbRootPath := mountPath(basePath, "/tmdb")
+	tmdbPathPrefix := mountPath(basePath, "/tmdb/")
+	mux.HandleFunc(tmdbRootPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			writeCORSHeaders(w)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeCORSHeaders(w)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+	})
+	mux.HandleFunc(tmdbPathPrefix, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			writeCORSHeaders(w)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeCORSHeaders(w)
+
+		rest := strings.TrimPrefix(r.URL.Path, tmdbPathPrefix)
+		rest = strings.TrimLeft(rest, "/")
+		if rest == "" {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		up := &url.URL{
+			Scheme:   "https",
+			Host:     "api.themoviedb.org",
+			Path:     "/" + rest,
+			RawQuery: r.URL.RawQuery,
+		}
+
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, up.String(), nil)
+		if err != nil {
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			return
+		}
+		req.Header.Set("Accept", r.Header.Get("Accept"))
+		if v := strings.TrimSpace(r.Header.Get("Authorization")); v != "" {
+			req.Header.Set("Authorization", v)
+		}
+		if v := strings.TrimSpace(r.Header.Get("Accept-Language")); v != "" {
+			req.Header.Set("Accept-Language", v)
+		}
+		if v := strings.TrimSpace(r.Header.Get("If-None-Match")); v != "" {
+			req.Header.Set("If-None-Match", v)
+		}
+		if v := strings.TrimSpace(r.Header.Get("If-Modified-Since")); v != "" {
+			req.Header.Set("If-Modified-Since", v)
+		}
+
+		upRes, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			return
+		}
+		defer upRes.Body.Close()
+
+		copyHeader(w.Header(), upRes.Header)
+		w.WriteHeader(upRes.StatusCode)
+		if r.Method == http.MethodHead {
+			return
+		}
+		_ = streamCopy(w, upRes.Body)
+	})
+
+	// TMDB image proxy: GET/HEAD /tmdb-img/<path> -> https://image.tmdb.org/<path>
+	//
+	// Example:
+	// - GET /tmdb-img/t/p/w500/abc.jpg -> https://image.tmdb.org/t/p/w500/abc.jpg
+	//
+	// Notes:
+	// - Keep the upstream host fixed to avoid SSRF.
+	// - Register a longer prefix than tokenPathPrefix so net/http mux picks it.
+	tmdbImgRootPath := mountPath(basePath, "/tmdb-img")
+	tmdbImgPathPrefix := mountPath(basePath, "/tmdb-img/")
+	mux.HandleFunc(tmdbImgRootPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			writeCORSHeaders(w)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeCORSHeaders(w)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+	})
+	mux.HandleFunc(tmdbImgPathPrefix, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			writeCORSHeaders(w)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeCORSHeaders(w)
+
+		rest := strings.TrimPrefix(r.URL.Path, tmdbImgPathPrefix)
+		rest = strings.TrimLeft(rest, "/")
+		if rest == "" {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		up := &url.URL{
+			Scheme:   "https",
+			Host:     "image.tmdb.org",
+			Path:     "/" + rest,
+			RawQuery: r.URL.RawQuery,
+		}
+
+		// For images, support Range requests (some clients/CDNs like it).
+		// Use the shared streaming proxy to reuse existing range/chunking logic.
+		tw := &trackedWriter{ResponseWriter: w}
+		if err := proxyStream(client, tw, r, up.String(), nil, r.Method == http.MethodHead); err != nil {
+			log.Printf("[tmdb-img] error=%v", err)
+			if !tw.WroteHeader {
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			}
+			return
+		}
+	})
+
 	// Proxy endpoint: GET/HEAD /<token> (or /<basePath>/<token>)
 	// We intentionally use the root prefix so the public playback URL is compact.
 	// Specific handlers like `/speed` and `/register` still win due to net/http mux longest-prefix matching.
@@ -508,7 +645,7 @@ func serveOnce(
 
 		// Do not allow paths that look like unregistered routes.
 		// Example: /register/ or /speed/ should be rejected, not treated as a token.
-		if seg0 == "register" || seg0 == "speed" || seg0 == "version" {
+		if seg0 == "register" || seg0 == "speed" || seg0 == "version" || seg0 == "tmdb" || seg0 == "tmdb-img" {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -767,7 +904,7 @@ func main() {
 
 func writeCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "Range, If-Range, Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Range, If-Range, Content-Type, Authorization, Accept, Accept-Language, If-None-Match, If-Modified-Since")
 	w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, POST")
 }

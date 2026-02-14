@@ -8,6 +8,10 @@
   - `POST /register` body: `{ "url": "<url>", "headers": { ... } }`
 - 播放透传
   - `GET /<token>`
+- TMDB API 代理（固定上游 `api.themoviedb.org`）
+  - `GET /tmdb/<path>`（例如：`/tmdb/3/search/multi?...`）
+- TMDB 图片代理（固定上游 `image.tmdb.org`）
+  - `GET /tmdb-img/<path>`（例如：`/tmdb-img/t/p/w500/xxx.jpg`）
 - 测速
   - `GET /speed?bytes=2097152`（返回指定大小的随机字节，用于前端测速）
 - 版本信息
@@ -35,5 +39,17 @@ go run .
 
 - 注册：`POST /proxy/register`
 - 透传：`GET /proxy/<token>`
+- TMDB：`GET /proxy/tmdb/<path>`（用于把 MeowFilm 的 `tmdb_api_base` 指到这里）
+- TMDB 图片：`GET /proxy/tmdb-img/<path>`
 - 测速：`GET /proxy/speed?bytes=2097152`
 - 版本：`GET /proxy/version`
+
+### 与 MeowFilm 的 `tmdb_api_base` 配合
+
+如果 GoProxy 通过 Nginx 挂在二级目录（例如 `/proxy`），并希望把 TMDB 的请求走同域代理：
+
+- GoProxy：`basePath = "/proxy"`
+- MeowFilm 后台（全局设置 - TMDB - API Base）：填 `https://<你的域名>/proxy/tmdb/3`
+
+这样 MeowFilm 里对 `search/multi`、`tv/<id>`、`movie/<id>` 等的拼接会变为：
+`https://<你的域名>/proxy/tmdb/3/...`，由 GoProxy 透传到 `https://api.themoviedb.org/3/...`。
