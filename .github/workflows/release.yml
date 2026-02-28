@@ -15,25 +15,43 @@ defaults:
     working-directory: .
 
 jobs:
-  build:
-    name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+  prepare_release:
+    name: prepare-release
     runs-on: ubuntu-latest
+    steps:
+      - name: Ensure release exists
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body: "Preparing release assets..."
+
+  build:
+    name: build-${{ matrix.asset_os }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: prepare_release
     strategy:
       fail-fast: false
       matrix:
         include:
           - goos: linux
-            goarch: 386
-          - goos: linux
             goarch: amd64
+            asset_os: linux
           - goos: linux
             goarch: arm64
-          - goos: windows
-            goarch: 386
+            asset_os: linux
+          - goos: linux
+            goarch: amd64
+            asset_os: linux-musl
+          - goos: linux
+            goarch: arm64
+            asset_os: linux-musl
           - goos: windows
             goarch: amd64
+            asset_os: windows
           - goos: windows
             goarch: arm64
+            asset_os: windows
 
     steps:
       - uses: actions/checkout@v4
@@ -75,42 +93,32 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          ASSET_OS: ${{ matrix.asset_os }}
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
           mkdir -p dist
           ext=""
           if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
-          out="dist/goproxy_${GOOS}_${GOARCH}${ext}"
+          out="dist/goproxy_${ASSET_OS}_${GOARCH}${ext}"
           go build -trimpath -ldflags="-s -w -X main.BuildVersion=${{ inputs.version }}" -o "${out}" .
           echo "built: ${out}"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload asset to release
+        uses: softprops/action-gh-release@v2
         with:
-          name: goproxy_${{ matrix.goos }}_${{ matrix.goarch }}
-          path: dist/
-          if-no-files-found: error
+          tag_name: ${{ inputs.version }}
+          files: dist/goproxy_${{ matrix.asset_os }}_${{ matrix.goarch }}*
+          overwrite_files: true
 
   release:
     name: release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [prepare_release, build]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: release-dist
-
-      - name: Flatten artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          find release-dist -maxdepth 2 -type f -print0 | xargs -0 -I{} mv {} dist/
-          ls -la dist
 
       - name: Generate release notes (since latest stable tag)
         shell: bash
@@ -149,4 +157,3 @@ jobs:
           tag_name: ${{ inputs.version }}
           name: ${{ inputs.version }}
           body_path: notes.md
-          files: dist/*

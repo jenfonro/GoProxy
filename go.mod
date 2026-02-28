@@ -1,4 +1,4 @@
-module catpawopen-go-proxy
+module catpawrunner-go-proxy
 
 go 1.21
 
