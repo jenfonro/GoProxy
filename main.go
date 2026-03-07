@@ -48,10 +48,38 @@ const (
 	defaultSpeedChunkBytes   = 64 * 1024
 	defaultChunkThresholdB   = 64 * 1024 * 1024
 	defaultUpstreamChunkSize = 32 * 1024 * 1024
+	defaultUpstreamPoolSize  = 10
+	maxUpstreamPoolSize      = 16
 
 	defaultConfigPollInterval = 1 * time.Second
 	defaultConfigDebounce     = 200 * time.Millisecond
 )
+
+type streamOptions struct {
+	ChunkSize int64
+	PoolSize  int
+}
+
+func defaultStreamOptions() streamOptions {
+	return streamOptions{
+		ChunkSize: int64(defaultUpstreamChunkSize),
+		PoolSize:  defaultUpstreamPoolSize,
+	}
+}
+
+func normalizeStreamOptions(opts streamOptions) streamOptions {
+	out := opts
+	if out.ChunkSize < 1024*1024 {
+		out.ChunkSize = 1024 * 1024
+	}
+	if out.PoolSize <= 0 {
+		out.PoolSize = defaultUpstreamPoolSize
+	}
+	if out.PoolSize > maxUpstreamPoolSize {
+		out.PoolSize = maxUpstreamPoolSize
+	}
+	return out
+}
 
 type entry struct {
 	URL         string       `json:"url"`
@@ -603,7 +631,7 @@ func serveOnce(
 		// For images, support Range requests (some clients/CDNs like it).
 		// Use the shared streaming proxy to reuse existing range/chunking logic.
 		tw := &trackedWriter{ResponseWriter: w}
-		if err := proxyStream(client, tw, r, up.String(), nil, r.Method == http.MethodHead); err != nil {
+		if err := proxyStream(client, tw, r, up.String(), nil, r.Method == http.MethodHead, defaultStreamOptions()); err != nil {
 			log.Printf("[tmdb-img] error=%v", err)
 			if !tw.WroteHeader {
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -707,8 +735,20 @@ func serveOnce(
 			return
 		}
 
+		opts := defaultStreamOptions()
+		if raw := strings.TrimSpace(r.URL.Query().Get("thread")); raw != "" {
+			if v, err := strconv.Atoi(raw); err == nil {
+				opts.PoolSize = v
+			}
+		}
+		// Keep compatibility with catpawrunner: chunkSize is in KB.
+		if raw := strings.TrimSpace(r.URL.Query().Get("chunkSize")); raw != "" {
+			if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+				opts.ChunkSize = v * 1024
+			}
+		}
 		tw := &trackedWriter{ResponseWriter: w}
-		if err := proxyStream(client, tw, r, target, e.HeaderLines, r.Method == http.MethodHead); err != nil {
+		if err := proxyStream(client, tw, r, target, e.HeaderLines, r.Method == http.MethodHead, opts); err != nil {
 			log.Printf("[proxy] token=%s error=%v", token, err)
 			if !tw.WroteHeader {
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -919,24 +959,16 @@ func (tw *trackedWriter) WriteHeader(code int) {
 	tw.ResponseWriter.WriteHeader(code)
 }
 
-func proxyStream(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers []headerLine, headOnly bool) error {
+func proxyStream(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers []headerLine, headOnly bool, opts streamOptions) error {
+	opts = normalizeStreamOptions(opts)
 	rangeHeader := r.Header.Get("Range")
 	ifRange := r.Header.Get("If-Range")
 
 	// For very large ranges, some upstreams throttle heavily. Work around by stitching
-	// multiple smaller upstream range requests into a single client response.
+	// smaller upstream range requests into a single client response.
 	if !headOnly && rangeHeader != "" {
 		if start, end, ok := parseRangeBytes(rangeHeader); ok && start >= 0 {
-			// Only chunk when the requested length is large OR open-ended.
-			threshold := int64(defaultChunkThresholdB)
-			chunkSize := int64(defaultUpstreamChunkSize)
-			if chunkSize < 1024*1024 {
-				chunkSize = 1024 * 1024
-			}
-			openEnded := end < 0
-			if openEnded || (end-start+1) > threshold {
-				return proxyStreamChunked(client, w, r, target, headers, ifRange, start, end, chunkSize)
-			}
+			return proxyStreamChunked(client, w, r, target, headers, ifRange, start, end, opts.ChunkSize, opts.PoolSize)
 		}
 	}
 
@@ -1126,7 +1158,7 @@ func parseContentRangeTotal(h string) (total int64, ok bool) {
 	return t, true
 }
 
-func proxyStreamChunked(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers []headerLine, ifRange string, start int64, end int64, chunkSize int64) error {
+func proxyStreamChunked(client *http.Client, w http.ResponseWriter, r *http.Request, target string, headers []headerLine, ifRange string, start int64, end int64, chunkSize int64, poolSize int) error {
 	ctx := r.Context()
 	curStart := start
 
@@ -1181,29 +1213,115 @@ func proxyStreamChunked(client *http.Client, w http.ResponseWriter, r *http.Requ
 	}
 
 	curStart = firstEnd + 1
-	for curStart <= end {
+	if curStart > end {
+		return nil
+	}
+
+	type chunkJob struct {
+		Index int
+		Start int64
+		End   int64
+	}
+	type chunkResult struct {
+		Index int
+		Body  []byte
+		Err   error
+	}
+	jobs := make([]chunkJob, 0, 32)
+	for i := 0; curStart <= end; i++ {
 		curEnd := curStart + chunkSize - 1
 		if curEnd > end {
 			curEnd = end
 		}
-		rh := fmt.Sprintf("bytes=%d-%d", curStart, curEnd)
-		res, err := followRedirects(ctx, client, target, headers, rh, ifRange)
-		if err != nil {
-			return err
-		}
-		// Always close before next iteration.
-		func() {
-			defer res.Body.Close()
-			if res.StatusCode != http.StatusPartialContent {
-				err = fmt.Errorf("upstream status=%d for %s", res.StatusCode, rh)
-				return
-			}
-			err = streamCopy(w, res.Body)
-		}()
-		if err != nil {
-			return err
-		}
+		jobs = append(jobs, chunkJob{Index: i, Start: curStart, End: curEnd})
 		curStart = curEnd + 1
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	if poolSize <= 1 {
+		for _, j := range jobs {
+			rh := fmt.Sprintf("bytes=%d-%d", j.Start, j.End)
+			res, err := followRedirects(ctx, client, target, headers, rh, ifRange)
+			if err != nil {
+				return err
+			}
+			func() {
+				defer res.Body.Close()
+				if res.StatusCode != http.StatusPartialContent {
+					err = fmt.Errorf("upstream status=%d for %s", res.StatusCode, rh)
+					return
+				}
+				err = streamCopy(w, res.Body)
+			}()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if poolSize > len(jobs) {
+		poolSize = len(jobs)
+	}
+
+	jobCh := make(chan chunkJob, len(jobs))
+	resCh := make(chan chunkResult, len(jobs))
+	for i := 0; i < poolSize; i++ {
+		go func() {
+			for j := range jobCh {
+				rh := fmt.Sprintf("bytes=%d-%d", j.Start, j.End)
+				res, err := followRedirects(ctx, client, target, headers, rh, ifRange)
+				if err != nil {
+					resCh <- chunkResult{Index: j.Index, Err: err}
+					continue
+				}
+				func() {
+					defer res.Body.Close()
+					if res.StatusCode != http.StatusPartialContent {
+						err = fmt.Errorf("upstream status=%d for %s", res.StatusCode, rh)
+						resCh <- chunkResult{Index: j.Index, Err: err}
+						return
+					}
+					body, readErr := io.ReadAll(res.Body)
+					if readErr != nil {
+						resCh <- chunkResult{Index: j.Index, Err: readErr}
+						return
+					}
+					resCh <- chunkResult{Index: j.Index, Body: body}
+				}()
+			}
+		}()
+	}
+	for _, j := range jobs {
+		jobCh <- j
+	}
+	close(jobCh)
+
+	flusher, _ := w.(http.Flusher)
+	pending := make(map[int][]byte, poolSize)
+	expect := 0
+	for done := 0; done < len(jobs); done++ {
+		res := <-resCh
+		if res.Err != nil {
+			return res.Err
+		}
+		pending[res.Index] = res.Body
+		for {
+			body, ok := pending[expect]
+			if !ok {
+				break
+			}
+			delete(pending, expect)
+			if len(body) > 0 {
+				if _, err := w.Write(body); err != nil {
+					return err
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			expect++
+		}
 	}
 	return nil
 }
