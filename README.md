@@ -31,9 +31,24 @@ go run .
 
 ```json
 {
-  "basePath": "/proxy"
+  "basePath": "/proxy",
+  "proxy": {
+    "thread": 10,
+    "chunk_size_kb": 2048,
+    "timeout_ms": 10000
+  }
 }
 ```
+
+- `proxy.thread`：上游分片并发数
+- `proxy.chunk_size_kb`：单个分片大小，单位 `KB`
+- `proxy.timeout_ms`：单个上游请求超时，单位毫秒
+
+请求参数仍可覆盖配置：
+
+- `thread`
+- `chunkSize`：单位 `KB`
+- `timeout`：单位毫秒
 
 当 `basePath` 设置为 `/proxy` 时：
 

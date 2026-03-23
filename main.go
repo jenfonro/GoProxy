@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,19 +75,6 @@ type streamOptions struct {
 	ProbeDirectConns int
 	ChunkHedgeConns  int
 	ChunkHedgeDelay  time.Duration
-}
-
-func defaultStreamOptions() streamOptions {
-	return streamOptions{
-		ChunkSize:        int64(defaultUpstreamChunkSize),
-		PoolSize:         defaultUpstreamPoolSize,
-		Timeout:          time.Duration(defaultUpstreamTimeoutMs) * time.Millisecond,
-		Retries:          defaultUpstreamRetries,
-		BypassChunking:   false,
-		ProbeDirectConns: defaultProbeDirectConns,
-		ChunkHedgeConns:  defaultChunkHedgeConns,
-		ChunkHedgeDelay:  time.Duration(defaultChunkHedgeDelayMs) * time.Millisecond,
-	}
 }
 
 func normalizeStreamOptions(opts streamOptions) streamOptions {
@@ -491,11 +479,48 @@ func normalizeReleaseSemver(raw string) string {
 }
 
 type config struct {
-	BasePath string `json:"basePath"`
+	BasePath string      `json:"basePath"`
+	Proxy    proxyConfig `json:"proxy"`
+}
+
+type proxyConfig struct {
+	Thread      int   `json:"thread"`
+	ChunkSizeKB int64 `json:"chunk_size_kb"`
+	TimeoutMS   int64 `json:"timeout_ms"`
 }
 
 func defaultConfig() config {
-	return config{BasePath: ""}
+	return config{
+		BasePath: "",
+		Proxy: proxyConfig{
+			Thread:      defaultUpstreamPoolSize,
+			ChunkSizeKB: int64(defaultUpstreamChunkSize / 1024),
+			TimeoutMS:   defaultUpstreamTimeoutMs,
+		},
+	}
+}
+
+func defaultStreamOptions(cfg config) streamOptions {
+	opts := streamOptions{
+		ChunkSize:        int64(defaultUpstreamChunkSize),
+		PoolSize:         defaultUpstreamPoolSize,
+		Timeout:          time.Duration(defaultUpstreamTimeoutMs) * time.Millisecond,
+		Retries:          defaultUpstreamRetries,
+		BypassChunking:   false,
+		ProbeDirectConns: defaultProbeDirectConns,
+		ChunkHedgeConns:  defaultChunkHedgeConns,
+		ChunkHedgeDelay:  time.Duration(defaultChunkHedgeDelayMs) * time.Millisecond,
+	}
+	if cfg.Proxy.Thread > 0 {
+		opts.PoolSize = cfg.Proxy.Thread
+	}
+	if cfg.Proxy.ChunkSizeKB > 0 {
+		opts.ChunkSize = cfg.Proxy.ChunkSizeKB * 1024
+	}
+	if cfg.Proxy.TimeoutMS > 0 {
+		opts.Timeout = time.Duration(cfg.Proxy.TimeoutMS) * time.Millisecond
+	}
+	return normalizeStreamOptions(opts)
 }
 
 func normalizeBasePath(p string) string {
@@ -568,6 +593,15 @@ func loadConfig(path string) (config, error) {
 		return config{}, err
 	}
 	cfg.BasePath = normalizeBasePath(cfg.BasePath)
+	if cfg.Proxy.Thread <= 0 {
+		cfg.Proxy.Thread = defaultConfig().Proxy.Thread
+	}
+	if cfg.Proxy.ChunkSizeKB <= 0 {
+		cfg.Proxy.ChunkSizeKB = defaultConfig().Proxy.ChunkSizeKB
+	}
+	if cfg.Proxy.TimeoutMS <= 0 {
+		cfg.Proxy.TimeoutMS = defaultConfig().Proxy.TimeoutMS
+	}
 	return cfg, nil
 }
 
@@ -601,11 +635,11 @@ func watchConfig(path string, initial config, stop <-chan struct{}, restart chan
 				log.Printf("[config] reload failed: %v", err)
 				continue
 			}
-			if cfg.BasePath == lastCfg.BasePath {
+			if reflect.DeepEqual(cfg, lastCfg) {
 				continue
 			}
 			lastCfg = cfg
-			log.Printf("[config] changed, restarting (basePath=%q)", cfg.BasePath)
+			log.Printf("[config] changed, restarting (basePath=%q thread=%d chunkKB=%d timeoutMs=%d)", cfg.BasePath, cfg.Proxy.Thread, cfg.Proxy.ChunkSizeKB, cfg.Proxy.TimeoutMS)
 			select {
 			case restart <- struct{}{}:
 			default:
@@ -823,7 +857,7 @@ func serveOnce(
 		// For images, support Range requests (some clients/CDNs like it).
 		// Use the shared streaming proxy to reuse existing range/chunking logic.
 		tw := &trackedWriter{ResponseWriter: w}
-		if _, err := proxyStream(client, tw, r, up.String(), nil, "", "", "", r.Method == http.MethodHead, defaultStreamOptions()); err != nil {
+		if _, err := proxyStream(client, tw, r, up.String(), nil, "", "", "", r.Method == http.MethodHead, defaultStreamOptions(cfg)); err != nil {
 			log.Printf("[tmdb-img] error=%v", err)
 			if !tw.WroteHeader {
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -927,7 +961,7 @@ func serveOnce(
 			return
 		}
 
-		opts := defaultStreamOptions()
+		opts := defaultStreamOptions(cfg)
 		if raw := strings.TrimSpace(r.URL.Query().Get("thread")); raw != "" {
 			if v, err := strconv.Atoi(raw); err == nil {
 				opts.PoolSize = v
