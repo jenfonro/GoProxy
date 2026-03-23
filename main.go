@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -562,17 +563,71 @@ func findConfigPath() string {
 	return "config.json"
 }
 
-func ensureDefaultConfigFile(path string) error {
-	if fileExists(path) {
-		return nil
+func mergeMissingConfig(dst map[string]any, src map[string]any) bool {
+	if dst == nil || src == nil {
+		return false
 	}
+	changed := false
+	for k, sv := range src {
+		if cur, ok := dst[k]; ok {
+			sm, sok := sv.(map[string]any)
+			dm, dok := cur.(map[string]any)
+			if sok && dok {
+				if mergeMissingConfig(dm, sm) {
+					changed = true
+				}
+			}
+			continue
+		}
+		dst[k] = sv
+		changed = true
+	}
+	return changed
+}
+
+func ensureConfigDefaults(path string) error {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
-	b, err := json.MarshalIndent(defaultConfig(), "", "  ")
+
+	defBytes, err := json.Marshal(defaultConfig())
+	if err != nil {
+		return err
+	}
+	def := map[string]any{}
+	if err := json.Unmarshal(defBytes, &def); err != nil {
+		return err
+	}
+	if !fileExists(path) {
+		b, err := json.MarshalIndent(def, "", "  ")
+		if err != nil {
+			return err
+		}
+		b = append(b, '\n')
+		return os.WriteFile(path, b, 0o644)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cur map[string]any
+	if len(bytes.TrimSpace(raw)) == 0 {
+		cur = map[string]any{}
+	} else if err := json.Unmarshal(raw, &cur); err != nil {
+		return err
+	}
+	if cur == nil {
+		cur = map[string]any{}
+	}
+
+	if !mergeMissingConfig(cur, def) {
+		return nil
+	}
+	b, err := json.MarshalIndent(cur, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -629,6 +684,11 @@ func watchConfig(path string, initial config, stop <-chan struct{}, restart chan
 			lastMod = st.ModTime()
 
 			time.Sleep(defaultConfigDebounce)
+
+			if err := ensureConfigDefaults(path); err != nil {
+				log.Printf("[config] apply defaults failed: %v", err)
+				continue
+			}
 
 			cfg, err := loadConfig(path)
 			if err != nil {
@@ -1010,8 +1070,8 @@ func serveOnce(
 			currentContentType = strings.TrimSpace(e.ContentType)
 			fallbackContentType = strings.TrimSpace(e.FallbackContentType)
 		}
-		tw := &trackedWriter{ResponseWriter: w}
 		reqStart := time.Now()
+		tw := &trackedWriter{ResponseWriter: w, RequestStart: reqStart}
 		log.Printf("[proxy][start] token=%s action=%s method=%s range=%q probePreflight=%t probeConn=%d pool=%d chunk=%d timeoutMs=%d hedge=%d hedgeDelayMs=%d targetHost=%s",
 			token,
 			action,
@@ -1039,7 +1099,7 @@ func serveOnce(
 			opts,
 		)
 		if err != nil {
-			log.Printf("[proxy][error] token=%s action=%s method=%s range=%q probePreflight=%t status=%d wrote=%d durationMs=%d err=%v",
+			log.Printf("[proxy][error] token=%s action=%s method=%s range=%q probePreflight=%t status=%d wrote=%d firstByteMs=%d durationMs=%d err=%v",
 				token,
 				action,
 				r.Method,
@@ -1047,6 +1107,7 @@ func serveOnce(
 				probePreflight,
 				tw.StatusCode,
 				tw.BytesWritten,
+				tw.FirstByteLatency().Milliseconds(),
 				time.Since(reqStart).Milliseconds(),
 				err,
 			)
@@ -1055,7 +1116,7 @@ func serveOnce(
 			}
 			return
 		}
-		log.Printf("[proxy][done] token=%s action=%s method=%s range=%q probePreflight=%t status=%d wrote=%d durationMs=%d resolvedType=%q",
+		log.Printf("[proxy][done] token=%s action=%s method=%s range=%q probePreflight=%t status=%d wrote=%d firstByteMs=%d durationMs=%d resolvedType=%q",
 			token,
 			action,
 			r.Method,
@@ -1063,6 +1124,7 @@ func serveOnce(
 			probePreflight,
 			tw.StatusCode,
 			tw.BytesWritten,
+			tw.FirstByteLatency().Milliseconds(),
 			time.Since(reqStart).Milliseconds(),
 			strings.TrimSpace(resolvedType),
 		)
@@ -1201,7 +1263,7 @@ func main() {
 	tokenTTL := time.Duration(defaultTokenTTLSeconds) * time.Second
 
 	cfgPath := findConfigPath()
-	if err := ensureDefaultConfigFile(cfgPath); err != nil {
+	if err := ensureConfigDefaults(cfgPath); err != nil {
 		log.Fatalf("failed to initialize config file %q: %v", cfgPath, err)
 	}
 
@@ -1280,6 +1342,8 @@ type trackedWriter struct {
 	WroteHeader  bool
 	StatusCode   int
 	BytesWritten int64
+	RequestStart time.Time
+	FirstWriteAt time.Time
 }
 
 func (tw *trackedWriter) WriteHeader(code int) {
@@ -1293,8 +1357,18 @@ func (tw *trackedWriter) Write(p []byte) (int, error) {
 		tw.WriteHeader(http.StatusOK)
 	}
 	n, err := tw.ResponseWriter.Write(p)
+	if n > 0 && tw.FirstWriteAt.IsZero() {
+		tw.FirstWriteAt = time.Now()
+	}
 	tw.BytesWritten += int64(n)
 	return n, err
+}
+
+func (tw *trackedWriter) FirstByteLatency() time.Duration {
+	if tw == nil || tw.RequestStart.IsZero() || tw.FirstWriteAt.IsZero() {
+		return 0
+	}
+	return tw.FirstWriteAt.Sub(tw.RequestStart)
 }
 
 type cancelOnCloseReadCloser struct {
@@ -1784,6 +1858,7 @@ func proxyStreamChunked(
 		firstEnd = start + chunkSize - 1
 	}
 	firstRange := fmt.Sprintf("bytes=%d-%d", curStart, firstEnd)
+	log.Printf("[proxy][first-chunk] clientRange=%q firstRange=%q firstChunkBytes=%d", strings.TrimSpace(r.Header.Get("Range")), firstRange, firstEnd-curStart+1)
 	upRes, err := fetchWithRetry(ctx, client, target, headers, firstRange, ifRange, timeout, retries)
 	if err != nil {
 		return "", err
