@@ -35,6 +35,9 @@ go run .
   "proxy": {
     "thread": 10,
     "chunk_size_kb": 2048,
+    "read_ahead_mb": 32,
+    "cache_mode": "memory",
+    "cache_dir": "/tmp/goproxy-cache",
     "timeout_ms": 10000
   }
 }
@@ -42,6 +45,9 @@ go run .
 
 - `proxy.thread`：上游分片并发数
 - `proxy.chunk_size_kb`：单个分片大小，单位 `KB`
+- `proxy.read_ahead_mb`：单次请求的预读缓存窗口，单位 `MB`
+- `proxy.cache_mode`：预读缓存介质，可选 `memory` 或 `disk`
+- `proxy.cache_dir`：当 `cache_mode = "disk"` 时的缓存根目录；默认在系统 `tmp` 下，并按 `token` 分子目录存放
 - `proxy.timeout_ms`：单个上游请求超时，单位毫秒
 
 请求参数仍可覆盖配置：

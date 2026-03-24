@@ -65,11 +65,15 @@ const (
 
 	defaultConfigPollInterval = 1 * time.Second
 	defaultConfigDebounce     = 200 * time.Millisecond
+	defaultCacheMode          = "memory"
 )
 
 type streamOptions struct {
 	ChunkSize        int64
 	PoolSize         int
+	ReadAheadBytes   int64
+	CacheMode        string
+	CacheDir         string
 	Timeout          time.Duration
 	Retries          int
 	BypassChunking   bool
@@ -88,6 +92,16 @@ func normalizeStreamOptions(opts streamOptions) streamOptions {
 	}
 	if out.PoolSize > maxUpstreamPoolSize {
 		out.PoolSize = maxUpstreamPoolSize
+	}
+	if out.ReadAheadBytes <= 0 {
+		out.ReadAheadBytes = int64(defaultChunkWindowBytes)
+	}
+	if out.ReadAheadBytes < out.ChunkSize {
+		out.ReadAheadBytes = out.ChunkSize
+	}
+	out.CacheMode = normalizeCacheMode(out.CacheMode)
+	if out.CacheDir == "" {
+		out.CacheDir = defaultCacheDir()
 	}
 	if out.Timeout < 0 {
 		out.Timeout = 0
@@ -126,13 +140,21 @@ type entry struct {
 }
 
 type store struct {
-	mu   sync.RWMutex
-	ttl  time.Duration
-	data map[string]*entry
+	mu        sync.RWMutex
+	ttl       time.Duration
+	data      map[string]*entry
+	cacheRoot string
 }
 
-func newStore(ttl time.Duration) *store {
-	return &store{ttl: ttl, data: map[string]*entry{}}
+func newStore(ttl time.Duration, cacheRoot string) *store {
+	return &store{ttl: ttl, data: map[string]*entry{}, cacheRoot: strings.TrimSpace(cacheRoot)}
+}
+
+func removeTokenCacheDir(root string, token string) {
+	if strings.TrimSpace(root) == "" || strings.TrimSpace(token) == "" {
+		return
+	}
+	_ = os.RemoveAll(tokenCacheDir(root, token))
 }
 
 func (s *store) prune() {
@@ -142,6 +164,7 @@ func (s *store) prune() {
 	for k, v := range s.data {
 		if v == nil || v.URL == "" || now.Sub(v.TS) > s.ttl {
 			delete(s.data, k)
+			removeTokenCacheDir(s.cacheRoot, k)
 		}
 	}
 }
@@ -166,6 +189,7 @@ func (s *store) get(token string) (*entry, bool) {
 	}
 	if now.Sub(e.TS) > s.ttl {
 		delete(s.data, token)
+		removeTokenCacheDir(s.cacheRoot, token)
 		return nil, false
 	}
 	// Sliding expiration: refresh on access.
@@ -487,6 +511,9 @@ type config struct {
 type proxyConfig struct {
 	Thread      int   `json:"thread"`
 	ChunkSizeKB int64 `json:"chunk_size_kb"`
+	ReadAheadMB int64 `json:"read_ahead_mb"`
+	CacheMode   string `json:"cache_mode"`
+	CacheDir    string `json:"cache_dir"`
 	TimeoutMS   int64 `json:"timeout_ms"`
 }
 
@@ -496,6 +523,9 @@ func defaultConfig() config {
 		Proxy: proxyConfig{
 			Thread:      defaultUpstreamPoolSize,
 			ChunkSizeKB: int64(defaultUpstreamChunkSize / 1024),
+			ReadAheadMB: 32,
+			CacheMode:   defaultCacheMode,
+			CacheDir:    defaultCacheDir(),
 			TimeoutMS:   defaultUpstreamTimeoutMs,
 		},
 	}
@@ -505,6 +535,9 @@ func defaultStreamOptions(cfg config) streamOptions {
 	opts := streamOptions{
 		ChunkSize:        int64(defaultUpstreamChunkSize),
 		PoolSize:         defaultUpstreamPoolSize,
+		ReadAheadBytes:   int64(defaultChunkWindowBytes),
+		CacheMode:        defaultCacheMode,
+		CacheDir:         defaultCacheDir(),
 		Timeout:          time.Duration(defaultUpstreamTimeoutMs) * time.Millisecond,
 		Retries:          defaultUpstreamRetries,
 		BypassChunking:   false,
@@ -518,10 +551,75 @@ func defaultStreamOptions(cfg config) streamOptions {
 	if cfg.Proxy.ChunkSizeKB > 0 {
 		opts.ChunkSize = cfg.Proxy.ChunkSizeKB * 1024
 	}
+	if cfg.Proxy.ReadAheadMB > 0 {
+		opts.ReadAheadBytes = cfg.Proxy.ReadAheadMB * 1024 * 1024
+	}
+	opts.CacheMode = normalizeCacheMode(cfg.Proxy.CacheMode)
+	if v := strings.TrimSpace(cfg.Proxy.CacheDir); v != "" {
+		opts.CacheDir = v
+	}
 	if cfg.Proxy.TimeoutMS > 0 {
 		opts.Timeout = time.Duration(cfg.Proxy.TimeoutMS) * time.Millisecond
 	}
 	return normalizeStreamOptions(opts)
+}
+
+func normalizeCacheMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", defaultCacheMode:
+		return defaultCacheMode
+	case "disk", "file", "fs":
+		return "disk"
+	default:
+		return defaultCacheMode
+	}
+}
+
+func defaultCacheDir() string {
+	return filepath.Join(os.TempDir(), "goproxy-cache")
+}
+
+func tokenCacheDir(root string, token string) string {
+	base := strings.TrimSpace(root)
+	if base == "" {
+		base = defaultCacheDir()
+	}
+	t := strings.TrimSpace(token)
+	if t == "" {
+		return base
+	}
+	return filepath.Join(base, t)
+}
+
+func cleanupCacheRoot(root string, ttl time.Duration) {
+	base := strings.TrimSpace(root)
+	if base == "" {
+		return
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, ent := range entries {
+		if ent == nil || !ent.IsDir() {
+			continue
+		}
+		dirPath := filepath.Join(base, ent.Name())
+		info, err := ent.Info()
+		if err != nil {
+			_ = os.RemoveAll(dirPath)
+			continue
+		}
+		if ttl > 0 && now.Sub(info.ModTime()) > ttl {
+			_ = os.RemoveAll(dirPath)
+			continue
+		}
+		sub, err := os.ReadDir(dirPath)
+		if err == nil && len(sub) == 0 {
+			_ = os.Remove(dirPath)
+		}
+	}
 }
 
 func normalizeBasePath(p string) string {
@@ -653,6 +751,9 @@ func loadConfig(path string) (config, error) {
 	}
 	if cfg.Proxy.ChunkSizeKB <= 0 {
 		cfg.Proxy.ChunkSizeKB = defaultConfig().Proxy.ChunkSizeKB
+	}
+	if cfg.Proxy.ReadAheadMB <= 0 {
+		cfg.Proxy.ReadAheadMB = defaultConfig().Proxy.ReadAheadMB
 	}
 	if cfg.Proxy.TimeoutMS <= 0 {
 		cfg.Proxy.TimeoutMS = defaultConfig().Proxy.TimeoutMS
@@ -1022,6 +1123,7 @@ func serveOnce(
 		}
 
 		opts := defaultStreamOptions(cfg)
+		opts.CacheDir = tokenCacheDir(opts.CacheDir, token)
 		if raw := strings.TrimSpace(r.URL.Query().Get("thread")); raw != "" {
 			if v, err := strconv.Atoi(raw); err == nil {
 				opts.PoolSize = v
@@ -1072,7 +1174,7 @@ func serveOnce(
 		}
 		reqStart := time.Now()
 		tw := &trackedWriter{ResponseWriter: w, RequestStart: reqStart}
-		log.Printf("[proxy][start] token=%s action=%s method=%s range=%q probePreflight=%t probeConn=%d pool=%d chunk=%d timeoutMs=%d hedge=%d hedgeDelayMs=%d targetHost=%s",
+		log.Printf("[proxy][start] token=%s action=%s method=%s range=%q probePreflight=%t probeConn=%d pool=%d chunk=%d readAhead=%d cacheMode=%s timeoutMs=%d hedge=%d hedgeDelayMs=%d targetHost=%s",
 			token,
 			action,
 			r.Method,
@@ -1081,6 +1183,8 @@ func serveOnce(
 			opts.ProbeDirectConns,
 			opts.PoolSize,
 			opts.ChunkSize,
+			opts.ReadAheadBytes,
+			opts.CacheMode,
 			opts.Timeout.Milliseconds(),
 			opts.ChunkHedgeConns,
 			opts.ChunkHedgeDelay.Milliseconds(),
@@ -1234,7 +1338,7 @@ func serveOnce(
 	if basePath != "" {
 		log.Printf("Go proxy base path: %s", basePath)
 	}
-	log.Printf("Go proxy listening on %s (ttl=%s)", listen, s.ttl)
+	log.Printf("Go proxy listening on %s (ttl=%s cacheRoot=%s)", listen, s.ttl, s.cacheRoot)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -1296,7 +1400,9 @@ func main() {
 		},
 	}
 
-	s := newStore(tokenTTL)
+	cacheRoot := defaultCacheDir()
+	cleanupCacheRoot(cacheRoot, tokenTTL)
+	s := newStore(tokenTTL, cacheRoot)
 	go func() {
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
@@ -1344,6 +1450,19 @@ type trackedWriter struct {
 	BytesWritten int64
 	RequestStart time.Time
 	FirstWriteAt time.Time
+}
+
+type chunkJob struct {
+	Index int
+	Start int64
+	End   int64
+}
+
+type chunkResult struct {
+	Index int
+	Body  []byte
+	Path  string
+	Err   error
 }
 
 func (tw *trackedWriter) WriteHeader(code int) {
@@ -1426,8 +1545,8 @@ func proxyStream(
 					}
 				}
 			}
-			log.Printf("[proxy][mode] chunked range=%q chunk=%d pool=%d timeoutMs=%d retries=%d hedge=%d hedgeDelayMs=%d",
-				rangeHeader, opts.ChunkSize, opts.PoolSize, opts.Timeout.Milliseconds(), opts.Retries, effectiveHedgeConns, opts.ChunkHedgeDelay.Milliseconds())
+			log.Printf("[proxy][mode] chunked range=%q chunk=%d pool=%d readAhead=%d cacheMode=%s timeoutMs=%d retries=%d hedge=%d hedgeDelayMs=%d",
+				rangeHeader, opts.ChunkSize, opts.PoolSize, opts.ReadAheadBytes, opts.CacheMode, opts.Timeout.Milliseconds(), opts.Retries, effectiveHedgeConns, opts.ChunkHedgeDelay.Milliseconds())
 			return proxyStreamChunked(
 				client,
 				w,
@@ -1442,6 +1561,9 @@ func proxyStream(
 				end,
 				opts.ChunkSize,
 				opts.PoolSize,
+				opts.ReadAheadBytes,
+				opts.CacheMode,
+				opts.CacheDir,
 				opts.Timeout,
 				opts.Retries,
 				effectiveHedgeConns,
@@ -1839,6 +1961,9 @@ func proxyStreamChunked(
 	end int64,
 	chunkSize int64,
 	poolSize int,
+	readAheadBytes int64,
+	cacheMode string,
+	cacheDir string,
 	timeout time.Duration,
 	retries int,
 	chunkHedgeConns int,
@@ -1940,21 +2065,8 @@ func proxyStreamChunked(
 		return resolvedContentType, nil
 	}
 
-	windowBytes := int64(defaultChunkWindowBytes)
-	if windowBytes < chunkSize {
-		windowBytes = chunkSize
-	}
-	firstBlockFirstChunkHedge := true
-	for blockStart := curStart; blockStart <= end; {
-		blockEnd := blockStart + windowBytes - 1
-		if blockEnd > end {
-			blockEnd = end
-		}
-		if err := streamChunkBlock(ctx, client, w, target, headers, ifRange, blockStart, blockEnd, chunkSize, poolSize, timeout, retries, chunkHedgeConns, chunkHedgeDelay, firstBlockFirstChunkHedge); err != nil {
-			return "", err
-		}
-		firstBlockFirstChunkHedge = false
-		blockStart = blockEnd + 1
+	if err := streamChunkBlock(ctx, client, w, target, headers, ifRange, curStart, end, chunkSize, poolSize, readAheadBytes, cacheMode, cacheDir, timeout, retries, chunkHedgeConns, chunkHedgeDelay, true); err != nil {
+		return "", err
 	}
 	return resolvedContentType, nil
 }
@@ -1970,22 +2082,15 @@ func streamChunkBlock(
 	blockEnd int64,
 	chunkSize int64,
 	poolSize int,
+	readAheadBytes int64,
+	cacheMode string,
+	cacheDir string,
 	timeout time.Duration,
 	retries int,
 	chunkHedgeConns int,
 	chunkHedgeDelay time.Duration,
 	firstChunkHedge bool,
 ) error {
-	type chunkJob struct {
-		Index int
-		Start int64
-		End   int64
-	}
-	type chunkResult struct {
-		Index int
-		Body  []byte
-		Err   error
-	}
 	jobs := make([]chunkJob, 0, 128)
 	for i, cur := 0, blockStart; cur <= blockEnd; i++ {
 		curEnd := cur + chunkSize - 1
@@ -1998,89 +2103,203 @@ func streamChunkBlock(
 	if len(jobs) == 0 {
 		return nil
 	}
-	if poolSize <= 1 {
-		for idx, j := range jobs {
-			rh := fmt.Sprintf("bytes=%d-%d", j.Start, j.End)
-			hedgeConns := 1
-			if firstChunkHedge && idx == 0 {
-				hedgeConns = chunkHedgeConns
-			}
-			body, err := fetchChunkBodyWithHedge(ctx, client, target, headers, rh, ifRange, timeout, retries, hedgeConns, chunkHedgeDelay)
-			if err != nil {
-				return err
-			}
-			if len(body) > 0 {
-				if _, werr := w.Write(body); werr != nil {
-					return werr
-				}
-			}
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-		return nil
+	if readAheadBytes <= 0 {
+		readAheadBytes = int64(defaultChunkWindowBytes)
+	}
+	if readAheadBytes < chunkSize {
+		readAheadBytes = chunkSize
+	}
+	if poolSize <= 0 {
+		poolSize = 1
 	}
 	if poolSize > len(jobs) {
 		poolSize = len(jobs)
 	}
-
-	// Ordered batched dispatch:
-	// Request only a contiguous batch (size<=poolSize) at a time, then write in-order.
-	// This avoids issuing too many tail chunks before head chunks are ready.
 	flusher, _ := w.(http.Flusher)
-	for base := 0; base < len(jobs); base += poolSize {
-		limit := base + poolSize
-		if limit > len(jobs) {
-			limit = len(jobs)
-		}
-		batch := jobs[base:limit]
-		batchRes := make([][]byte, len(batch))
-		errCh := make(chan chunkResult, len(batch))
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobCh := make(chan chunkJob, poolSize)
+	resCh := make(chan chunkResult, len(jobs))
 
-		for i, j := range batch {
-			i := i
-			j := j
-			go func() {
-				rh := fmt.Sprintf("bytes=%d-%d", j.Start, j.End)
-				hedgeConns := 1
-				if firstChunkHedge && base == 0 && i == 0 {
-					hedgeConns = chunkHedgeConns
-				}
-				body, err := fetchChunkBodyWithHedge(ctx, client, target, headers, rh, ifRange, timeout, retries, hedgeConns, chunkHedgeDelay)
-				if err != nil {
-					errCh <- chunkResult{Index: i, Err: err}
+	for wid := 0; wid < poolSize; wid++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case j, ok := <-jobCh:
+					if !ok {
+						return
+					}
+					rh := fmt.Sprintf("bytes=%d-%d", j.Start, j.End)
+					hedgeConns := 1
+					if firstChunkHedge && j.Index == 0 {
+						hedgeConns = chunkHedgeConns
+					}
+					body, err := fetchChunkBodyWithHedge(ctx, client, target, headers, rh, ifRange, timeout, retries, hedgeConns, chunkHedgeDelay)
+					if err != nil {
+						resCh <- chunkResult{Index: j.Index, Err: err}
+						return
+					}
+					res, serr := storeChunkResult(cacheMode, cacheDir, j.Index, body)
+					if serr != nil {
+						resCh <- chunkResult{Index: j.Index, Err: serr}
+						return
+					}
+					resCh <- res
 				}
-				errCh <- chunkResult{Index: i, Body: body}
-			}()
-		}
+			}
+		}()
+	}
+	pending := make(map[int][]byte, len(jobs))
+	pendingPath := make(map[int]string, len(jobs))
+	pendingBytes := int64(0)
+	inFlightBytes := int64(0)
+	inFlight := 0
+	nextDispatch := 0
+	nextWrite := 0
+	var firstErr error
 
-		var firstErr error
-		for i := 0; i < len(batch); i++ {
-			res := <-errCh
-			if res.Err != nil && firstErr == nil {
+	jobSize := func(idx int) int64 {
+		if idx < 0 || idx >= len(jobs) {
+			return 0
+		}
+		j := jobs[idx]
+		return j.End - j.Start + 1
+	}
+	dispatchMore := func() {
+		for nextDispatch < len(jobs) && inFlight < poolSize {
+			size := jobSize(nextDispatch)
+			if inFlightBytes+pendingBytes+size > readAheadBytes && pendingBytes+inFlightBytes > 0 {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case jobCh <- jobs[nextDispatch]:
+				inFlight++
+				inFlightBytes += size
+				nextDispatch++
+			}
+		}
+	}
+
+	dispatchMore()
+	for nextWrite < len(jobs) {
+		if firstErr != nil && inFlight == 0 {
+			break
+		}
+		if inFlight == 0 {
+			break
+		}
+		res := <-resCh
+		inFlight--
+		inFlightBytes -= jobSize(res.Index)
+		if res.Err != nil {
+			if firstErr == nil {
 				firstErr = res.Err
-				continue
+				cancel()
 			}
-			if res.Err == nil {
-				batchRes[res.Index] = res.Body
+			if res.Path != "" {
+				_ = os.Remove(res.Path)
 			}
+			continue
 		}
-		if firstErr != nil {
-			return firstErr
+		if res.Path != "" {
+			pendingPath[res.Index] = res.Path
+		} else {
+			pending[res.Index] = res.Body
 		}
-
-		for _, body := range batchRes {
-			if len(body) == 0 {
-				continue
+		pendingBytes += jobSize(res.Index)
+		for {
+			body, okMem := pending[nextWrite]
+			path0, okDisk := pendingPath[nextWrite]
+			if !okMem && !okDisk {
+				break
 			}
-			if _, err := w.Write(body); err != nil {
+			res0 := chunkResult{Index: nextWrite, Body: body, Path: path0}
+			delete(pending, nextWrite)
+			delete(pendingPath, nextWrite)
+			pendingBytes -= jobSize(nextWrite)
+			if err := writeChunkResult(w, res0); err != nil {
+				cancel()
+				_ = cleanupChunkResult(res0)
 				return err
 			}
+			_ = cleanupChunkResult(res0)
 			if flusher != nil {
 				flusher.Flush()
 			}
+			nextWrite++
 		}
+		dispatchMore()
+	}
+	close(jobCh)
+	for _, path0 := range pendingPath {
+		if path0 != "" {
+			_ = os.Remove(path0)
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return nil
+}
+
+func storeChunkResult(cacheMode string, cacheDir string, index int, body []byte) (chunkResult, error) {
+	res := chunkResult{Index: index}
+	if normalizeCacheMode(cacheMode) != "disk" || len(body) == 0 {
+		res.Body = body
+		return res, nil
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return chunkResult{}, err
+	}
+	f, err := os.CreateTemp(cacheDir, "chunk-*")
+	if err != nil {
+		return chunkResult{}, err
+	}
+	name := f.Name()
+	if _, err := f.Write(body); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return chunkResult{}, err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return chunkResult{}, err
+	}
+	res.Path = name
+	return res, nil
+}
+
+func writeChunkResult(w http.ResponseWriter, res chunkResult) error {
+	if len(res.Body) > 0 {
+		_, err := w.Write(res.Body)
+		return err
+	}
+	if res.Path == "" {
+		return nil
+	}
+	f, err := os.Open(res.Path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(w, f)
+	return err
+}
+
+func cleanupChunkResult(res chunkResult) error {
+	if res.Path == "" {
+		return nil
+	}
+	if err := os.Remove(res.Path); err != nil {
+		return err
+	}
+	dir := filepath.Dir(res.Path)
+	if dir != "" && dir != "." {
+		_ = os.Remove(dir)
 	}
 	return nil
 }
